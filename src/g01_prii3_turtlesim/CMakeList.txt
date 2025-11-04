@@ -1,0 +1,14 @@
+cmake_minimum_required(VERSION 3.5)
+project(g01_prii3_turtlesim)
+
+find_package(ament_cmake REQUIRED)
+find_package(rclpy REQUIRED)
+find_package(rosidl_default_generators REQUIRED)
+
+# Generar servicios
+rosidl_generate_interfaces(${PROJECT_NAME}
+  "srv/DrawControl.srv"
+)
+
+ament_package()
+

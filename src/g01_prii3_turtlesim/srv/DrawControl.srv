@@ -1,0 +1,7 @@
+# Solicitud
+string action  # start | pause | resume | reset
+---
+# Respuesta
+bool success
+string message
+
