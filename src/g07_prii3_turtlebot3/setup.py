@@ -23,7 +23,10 @@ setup(
     license='TODO: License declaration',
     tests_require=['pytest'],
     entry_points={
-        'console_scripts': [
-        ],
-    },
+    'console_scripts': [
+        'deteccion = g07_prii3_turtlebot3.Deteccion:main',
+        'navegar = g07_prii3_turtlebot3.navegar:main',
+    ],
+},
+
 )
