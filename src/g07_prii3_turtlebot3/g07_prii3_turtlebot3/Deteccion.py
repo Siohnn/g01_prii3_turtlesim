@@ -7,70 +7,54 @@ from rclpy.node import Node
 from sensor_msgs.msg import Image
 from cv_bridge import CvBridge, CvBridgeError
 
-class ArucoUniversalNode(Node):
+class ArucoRobustNode(Node):
     def __init__(self):
-        super().__init__('aruco_universal_node')
+        super().__init__('aruco_robust_node')
 
-        # Configuración del tópico (ajústalo si es necesario)
         self.declare_parameter('camera_topic', '/camera/image_raw')
         self.camera_topic = self.get_parameter('camera_topic').value
 
-        # --- 1. LISTA COMPLETA DE DICCIONARIOS ---
-        # Reactivamos todos porque tus marcadores parecen ser 4x4 o 5x5 básicos
+        # --- DICCIONARIOS ---
+        # Reducimos la lista para evitar falsos positivos de diccionarios "gigantes"
+        # Si sabes que son 4x4 o 5x5, es mejor comentar el resto.
         self.ARUCO_DICTS = {
-            "DICT_4X4_50": cv2.aruco.DICT_4X4_50,
-            "DICT_4X4_100": cv2.aruco.DICT_4X4_100,
-            "DICT_4X4_250": cv2.aruco.DICT_4X4_250,
-            "DICT_4X4_1000": cv2.aruco.DICT_4X4_1000,
-            "DICT_5X5_50": cv2.aruco.DICT_5X5_50,
-            "DICT_5X5_100": cv2.aruco.DICT_5X5_100,
-            "DICT_5X5_250": cv2.aruco.DICT_5X5_250,
-            "DICT_5X5_1000": cv2.aruco.DICT_5X5_1000,
-            "DICT_6X6_50": cv2.aruco.DICT_6X6_50,
-            "DICT_6X6_100": cv2.aruco.DICT_6X6_100,
-            "DICT_6X6_250": cv2.aruco.DICT_6X6_250,
-            "DICT_6X6_1000": cv2.aruco.DICT_6X6_1000,
-            "DICT_7X7_50": cv2.aruco.DICT_7X7_50,
-            "DICT_7X7_100": cv2.aruco.DICT_7X7_100,
-            "DICT_7X7_250": cv2.aruco.DICT_7X7_250,
-            "DICT_7X7_1000": cv2.aruco.DICT_7X7_1000,
-            "DICT_ARUCO_ORIGINAL": cv2.aruco.DICT_ARUCO_ORIGINAL,
-            "DICT_APRILTAG_36h11": cv2.aruco.DICT_APRILTAG_36h11
+           "DICT_7X7_50": cv2.aruco.DICT_7X7_50
         }
 
-        # --- 2. PARÁMETROS EQUILIBRADOS ---
+        # --- PARÁMETROS ROBUSTOS (LA CLAVE DEL ARREGLO) ---
+        # Usamos sintaxis compatible con OpenCV 4.2 / 4.6
         self.parameters = cv2.aruco.DetectorParameters_create()
         
-        # UMBRALIZACIÓN (El ajuste clave para tus fotos)
-        # Antes estaba en 23 (muy pequeño para tus marcadores grandes).
-        # Lo subimos a 45. Si sigue fallando, prueba a subirlo a 55 o 65.
-        self.parameters.adaptiveThreshWinSizeMin = 5
-        self.parameters.adaptiveThreshWinSizeMax = 45 
+        # 1. TAMAÑO MÍNIMO: Ignorar cosas pequeñas (ladrillos)
+        # El marcador debe ocupar al menos el 3% del perímetro de la imagen
+        self.parameters.minMarkerPerimeterRate = 0.03 
+        
+        # 2. CALIDAD DEL CUADRADO: Ser exigente con la forma
+        self.parameters.polygonalApproxAccuracyRate = 0.05
+        
+        # 3. UMBRALIZACIÓN: Ajustes para iluminación de simuladores
+        # step size más grande ayuda a filtrar ruido fino
+        self.parameters.adaptiveThreshWinSizeMin = 3
+        self.parameters.adaptiveThreshWinSizeMax = 23
         self.parameters.adaptiveThreshWinSizeStep = 10
         
-        # FILTROS DE FORMA
-        # Relajamos un poco la precisión poligonal para aceptar formas "pixeladas"
-        self.parameters.polygonalApproxAccuracyRate = 0.06
-        
-        # FILTRO DE TAMAÑO (Para seguir ignorando ladrillos pequeños)
-        self.parameters.minMarkerPerimeterRate = 0.03 
+        # 4. RECHAZO DE BORDES: Si el aruco toca el borde de la imagen, ¿lo aceptamos?
+        # A veces ayuda ponerlo en 0 si la cámara se mueve mucho
+        self.parameters.minDistanceToBorder = 3
 
-        # --- Variables del sistema ---
+        # Variables
         self.current_dict_obj = None
         self.current_dict_name = None
         self.is_locked = False 
         self.br = CvBridge()
         
-        # Suscriptor y Publicadores
         self.subscription = self.create_subscription(Image, self.camera_topic, self.image_callback, 10)
-        self.publisher = self.create_publisher(Image, '/camera/aruco_result', 10)
-        # Tópico DEBUG: Suscríbete aquí en RViz para ver qué "ve" el robot
-        self.pub_debug = self.create_publisher(Image, '/camera/debug_view', 10)
+        self.publisher = self.create_publisher(Image, '/camera/aruco_filtered', 10)
+        self.pub_debug = self.create_publisher(Image, '/camera/debug_threshold', 10) # NUEVO: Para ver qué ve el robot
 
-        self.get_logger().info('✅ Nodo Universal Iniciado: Parámetros ajustados para bloques grandes.')
+        self.get_logger().info('Nodo Robusto Iniciado: Filtros de textura activados.')
 
     def buscar_mejor_diccionario(self, gray_frame):
-        """Busca en todos los diccionarios hasta encontrar uno válido."""
         votos = []
         for nombre_dict, codigo_dict in self.ARUCO_DICTS.items():
             aruco_dict = cv2.aruco.getPredefinedDictionary(codigo_dict)
@@ -78,17 +62,22 @@ class ArucoUniversalNode(Node):
 
             if ids is not None:
                 for i in range(len(ids)):
-                    # Filtramos cosas minúsculas (probablemente ruido de ladrillos)
+                    # FILTRO EXTRA: Si detectamos algo, verificamos su tamaño
                     perimetro = cv2.arcLength(corners[i][0], True)
-                    if perimetro > 80: 
+                    # Si es ridículamente pequeño (ladrillo lejano), no votamos por él
+                    if perimetro > 100: 
                         votos.append({"id": ids[i][0], "dict_name": nombre_dict})
 
         if not votos: return None, None
 
         conteo = Counter([v["id"] for v in votos])
-        id_ganador, _ = conteo.most_common(1)[0]
+        id_ganador, num_votos = conteo.most_common(1)[0]
         
-        # Obtenemos el nombre del diccionario ganador
+        # Si el ganador tiene muy pocos votos (ej. 1), podría ser ruido.
+        # Exigimos consistencia (opcional, pero recomendado)
+        if num_votos < 1: 
+            return None, None
+
         nombre_ganador = next(v["dict_name"] for v in votos if v["id"] == id_ganador)
         return nombre_ganador, self.ARUCO_DICTS[nombre_ganador]
 
@@ -99,45 +88,39 @@ class ArucoUniversalNode(Node):
 
         gray = cv2.cvtColor(cv_image, cv2.COLOR_BGR2GRAY)
 
-        # --- DEBUG VISUAL (Crucial para diagnóstico) ---
-        # Publicamos la imagen binaria que usa OpenCV internamente
-        debug_img = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_MEAN_C, cv2.THRESH_BINARY, 
-                                          self.parameters.adaptiveThreshWinSizeMax, 
-                                          self.parameters.adaptiveThreshConstant)
-        self.pub_debug.publish(self.br.cv2_to_imgmsg(debug_img, "mono8"))
-        # -----------------------------------------------
+        # --- DEBUG VISUAL (IMPORTANTE) ---
+        # Publicamos lo que el robot "ve" en blanco y negro. 
+        # Si aquí ves los ladrillos muy marcados, hay que ajustar 'adaptiveThresh'
+        debug_thresh = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_MEAN_C, cv2.THRESH_BINARY, 
+                                             self.parameters.adaptiveThreshWinSizeMax, 
+                                             self.parameters.adaptiveThreshConstant)
+        self.pub_debug.publish(self.br.cv2_to_imgmsg(debug_thresh, "mono8"))
+        # ---------------------------------
 
-        # Lógica de detección
         if not self.is_locked:
             nombre, codigo = self.buscar_mejor_diccionario(gray)
             if nombre:
                 self.current_dict_name = nombre
                 self.current_dict_obj = cv2.aruco.getPredefinedDictionary(codigo)
                 self.is_locked = True
-                self.get_logger().info(f"🔓 DICCIONARIO ENCONTRADO: {nombre}")
+                self.get_logger().info(f"DICCIONARIO DETECTADO: {nombre}")
             else:
-                # Feedback en pantalla mientras busca
-                cv2.putText(cv_image, "Escaneando...", (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+                cv2.putText(cv_image, "Filtrando ruido...", (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 165, 255), 2)
         else:
-            # Detección rápida una vez conocemos el diccionario
             corners, ids, _ = cv2.aruco.detectMarkers(gray, self.current_dict_obj, parameters=self.parameters)
-            
             if ids is not None:
                 cv2.aruco.drawDetectedMarkers(cv_image, corners, ids)
-                # Texto verde confirmando detección
-                cv2.putText(cv_image, f"ID: {ids.flatten()}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
-                self.get_logger().info(f"Detectado: {ids.flatten()}")
+                self.get_logger().info(f"📍 Detectado: {ids.flatten()}")
+                cv2.putText(cv_image, f"Dict: {self.current_dict_name}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
             else:
-                cv2.putText(cv_image, "Perdido...", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 165, 255), 2)
-                # Opcional: Desbloquear si se pierde mucho tiempo para buscar otro diccionario
-                # self.is_locked = False 
+                 # Si perdemos el tracking por mucho tiempo, podríamos desbloquear
+                 pass
 
-        # Publicar resultado final en color
         self.publisher.publish(self.br.cv2_to_imgmsg(cv_image, "bgr8"))
 
 def main(args=None):
     rclpy.init(args=args)
-    node = ArucoUniversalNode()
+    node = ArucoRobustNode()
     rclpy.spin(node)
     node.destroy_node()
     rclpy.shutdown()
